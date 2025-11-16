@@ -1,10 +1,9 @@
-from .model2D import HybridUNetCFM2D
-from .model3D import HybridUNetCFM3D
+from .UNets import SimpleUNet, SelfUNet
 
 from .version import __version__
 
 __all__ = [
-  'HybridUNetCFM2D',
-  'HybridUNetCFM3D',
+  'SimpleUNet'
+  'SelfUNet',
   '__version__'
   ]
