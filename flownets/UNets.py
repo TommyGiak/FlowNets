@@ -5,7 +5,7 @@
 import torch
 
 from torch import nn
-from .BlocksAndLayers import SinusoidalTimeEmb, TimeSequential, ResidualBlock, Downsample, Upsample, ConvBlock, convolution, SelfAttentionBlock
+from .BlocksAndLayers import SinusoidalTimeEmb, TimeSequential, ResidualBlock, Downsample, Upsample, ConvBlock, convolution, SelfAttentionBlock, zero_init_
 
 
 class SimpleUNet(nn.Module): # without attention
@@ -51,7 +51,7 @@ class SimpleUNet(nn.Module): # without attention
         
         # Bottleneck 
         bottleneck_ch = self.chs[-1]
-        self.bottleneck_res = nn.ModuleList(TimeSequential(*[ResidualBlock(d, ch=bottleneck_ch, time_emb_dim=time_emb_dim) for _ in range(n_residuals_blocks)]))
+        self.bottleneck_res = TimeSequential(*[ResidualBlock(d, ch=bottleneck_ch, time_emb_dim=time_emb_dim) for _ in range(n_residuals_blocks)])
 
         # Up path
         self.ups = nn.ModuleList([Upsample(d, in_ch=ic, out_ch=oc) for ic, oc in zip(reversed(self.chs[1:]), reversed(self.chs[:-1]))])
@@ -65,8 +65,7 @@ class SimpleUNet(nn.Module): # without attention
         assert len(self.res_blocks_decoder) == len(self.ups) == len(self.conv_skip_connection_decored)
         
         self.out_res = nn.Sequential(
-            convolution(d, in_channels=self.chs[0], out_channels=in_channels, kernel_size=3, padding=1, bias=True),
-            nn.Dropout(p=dropout),
+            zero_init_(convolution(d, in_channels=self.chs[0], out_channels=in_channels, kernel_size=3, padding=1, bias=True)),
         )
 
         pass
@@ -89,8 +88,7 @@ class SimpleUNet(nn.Module): # without attention
             x = down(x)
 
         # Bottleneck
-        for res in self.bottleneck_res:
-          x = res(x, t_emb)
+        x = self.bottleneck_res(x, t_emb)
         
         # Decoder
         for up, conv_skip, res in zip(self.ups, self.conv_skip_connection_decored, self.res_blocks_decoder):
@@ -179,7 +177,7 @@ class SelfUNet(nn.Module): # without attention
         
         # Bottleneck 
         bottleneck_ch = self.chs[-1]
-        self.bottleneck_res = nn.ModuleList(TimeSequential(*[ResidualBlock(d, ch=bottleneck_ch, time_emb_dim=time_emb_dim) for _ in range(n_residuals_blocks)]))
+        self.bottleneck_res = TimeSequential(*[ResidualBlock(d, ch=bottleneck_ch, time_emb_dim=time_emb_dim) for _ in range(n_residuals_blocks)])
 
         # Up path
         self.ups = nn.ModuleList([Upsample(d, in_ch=ic, out_ch=oc) for ic, oc in zip(reversed(self.chs[1:]), reversed(self.chs[:-1]))])
@@ -206,8 +204,7 @@ class SelfUNet(nn.Module): # without attention
         assert len(self.res_blocks_decoder) == len(self.ups) == len(self.conv_skip_connection_decored) == len(self.attn_up) - 1
         
         self.out_res = nn.Sequential(
-            convolution(d, in_channels=self.chs[0], out_channels=in_channels, kernel_size=3, padding=1, bias=True),
-            nn.Dropout(p=dropout),
+            zero_init_(convolution(d, in_channels=self.chs[0], out_channels=in_channels, kernel_size=3, padding=1, bias=True)),
         )
 
         pass
@@ -232,8 +229,7 @@ class SelfUNet(nn.Module): # without attention
 
         x = self.attn_down[-1](x)
         # Bottleneck
-        for res in self.bottleneck_res:
-          x = res(x, t_emb)
+        x = self.bottleneck_res(x, t_emb)
         x = self.attn_up[0](x)
         
         # Decoder

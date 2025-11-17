@@ -165,7 +165,6 @@ class ResidualBlock(nn.Module):
             self.time_proj = None
             
         self.conv2 = zero_init_(ConvBlock(image_dimensionality, ch, ch, num_groups=num_groups, dropout=dropout))
-        warnings.warn('Each ResBlock has the last Convolution inizialized to ZERO!')
 
     def forward(self, x, t_emb=None):
         h = self.conv1(x)
@@ -304,7 +303,6 @@ class SelfAttentionBlock(nn.Module):
         )
         self.out_reshape = nn.Linear(dim, channels*patch_volume)
         
-        warnings.warn('In SimpleTransformerBlock LayerNorm are used, not GroupNorm, but why? IDK maybe we are carzy')
         warnings.warn('The attention mechanism is implemented with torch, you may use flash attention... Flash attention is wanderful!')
         warnings.warn('The attention transformer block do not use ADAPTIVE layer/group norm... We do not like mutants')
 
