@@ -335,7 +335,7 @@ class CrossAttention(nn.Module):
     
     if (q_dim % heads != 0) or (k_dim % heads != 0) :
       raise ValueError(f'The dimensions of the embeddings ({q_dim} and {k_dim}) in CrossAttention must be multiples of the number of heads ({heads})!')
-    self.mha = nn.MultiheadAttention(num_heads=heads, embed_dim=q_dim, kdim=v_dim, vdim=v_dim,
+    self.mha = nn.MultiheadAttention(num_heads=heads, embed_dim=q_dim, kdim=k_dim, vdim=v_dim,
                                      dropout=dropout, bias=bias, add_zero_attn=False, batch_first=True)
 
   def forward(self, x, cond):
