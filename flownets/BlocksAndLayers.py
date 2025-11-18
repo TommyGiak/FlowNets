@@ -267,7 +267,7 @@ class Tokenizer(nn.Module):
 
     def tokenization(self, x):
         # x: (B, C, *IMG_SIZE)
-        return self.fancy_rashape(x)
+        return self.fancy_reshape(x)
     
     def invert_tokenization(self,tokens):
         return self.invert_fancy_reshape(tokens)
