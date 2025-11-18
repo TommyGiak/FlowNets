@@ -126,23 +126,26 @@ class TimeSequential(nn.Sequential):
 
 # --------------------------- Building blocks -------------------------
 class ConvBlock(nn.Module):
-    def __init__(self, image_dimensionality, in_ch, out_ch, kernel_size=3, padding=1, use_norm=True, num_groups=8, dropout=0):
+    def __init__(self, image_dimensionality, in_ch, out_ch, kernel_size=3, padding=1, use_norm=True, num_groups=16, dropout=0, zero_init=False):
         super().__init__()
         self.seq = nn.Sequential()
         
-        if in_ch<=4:
-            use_norm=False
-        
         if use_norm:
-            if num_groups>out_ch:
-                num_groups = out_ch
-            elif out_ch>=128:
-                num_groups = 16
+            
+            num_groups = out_ch if num_groups>out_ch else num_groups
+
             assert out_ch%num_groups==0, f'In the Conv2dBlock, the number of output channels ({out_ch}) must be a multiple of the number of groups ({num_groups})!'
-            self.seq.append(convolution(image_dimensionality, in_ch, out_ch, kernel_size=kernel_size, padding=padding, bias=False))
+            if zero_init:
+                self.seq.append(zero_init_(convolution(image_dimensionality, in_ch, out_ch, kernel_size=kernel_size, padding=padding, bias=False)))
+            else:
+                self.seq.append(convolution(image_dimensionality, in_ch, out_ch, kernel_size=kernel_size, padding=padding, bias=False))
             self.seq.append(nn.GroupNorm(num_groups=num_groups, num_channels=out_ch))
         else:
-            self.seq.append(convolution(image_dimensionality, in_ch, out_ch, kernel_size=kernel_size, padding=padding, bias=True))
+            if zero_init:
+                self.seq.append(zero_init_(convolution(image_dimensionality, in_ch, out_ch, kernel_size=kernel_size, padding=padding, bias=True)))
+            else:
+                self.seq.append(convolution(image_dimensionality, in_ch, out_ch, kernel_size=kernel_size, padding=padding, bias=True))
+        
         self.seq.append(nn.SiLU())
         
         if dropout > 0:
@@ -160,11 +163,10 @@ class ResidualBlock(nn.Module):
         
         if time_emb_dim is not None:
             self.time_proj = nn.Linear(time_emb_dim, ch)
-            self.silu = nn.SiLU()
         else:
             self.time_proj = None
-            
-        self.conv2 = zero_init_(ConvBlock(image_dimensionality, ch, ch, num_groups=num_groups, dropout=dropout))
+        
+        self.conv2 = ConvBlock(image_dimensionality, ch, ch, num_groups=num_groups, dropout=dropout, zero_init=True)
 
     def forward(self, x, t_emb=None):
         h = self.conv1(x)
@@ -177,8 +179,7 @@ class ResidualBlock(nn.Module):
             shape = [proj.size(0), proj.size(1)] + [1] * (h.dim() - 2)
             proj = proj.view(*shape)
             h = h + proj
-            h = self.silu(h)
-            
+
         h = self.conv2(h)
         return x + h
 
@@ -204,7 +205,7 @@ class Downsample(nn.Module):
 
 
 class Upsample(nn.Module):
-    def __init__(self, image_dimensionality, in_ch, out_ch=None, conv_layer=True, num_groups=8, upsample_mode='nearest'):
+    def __init__(self, image_dimensionality, in_ch, out_ch=None, conv_layer=True, num_groups=16, upsample_mode='nearest'):
         super().__init__()
         
         self.op = nn.Sequential()
@@ -212,10 +213,7 @@ class Upsample(nn.Module):
         if conv_layer:
             out_ch = out_ch or in_ch//2
             
-            if num_groups >= out_ch:
-                num_groups = out_ch//2
-            elif out_ch >= 128:
-                num_groups = 16
+            num_groups = out_ch if num_groups>out_ch else num_groups
             
             self.op.append(convolution_transpose(image_dimensionality, in_ch, out_ch, kernel_size=4, stride=2, padding=1))
             if num_groups:
@@ -235,9 +233,12 @@ class Tokenizer(nn.Module):
         super().__init__()
         self.p = patch_size
         self.image_size = image_size
+
+        for d in image_size:
+            assert d%patch_size==0, f'The image size at this layer {image_size} must be a multiple of the patch size {patch_size}! :=('
         
         if len(image_size) == 2:
-            self.fancy_rashape = lambda x: rearrange(
+            self.fancy_reshape = lambda x: rearrange(
                 x,
                 'b c (h p1) (w p2) -> b (h w) (c p1 p2)',
                 p1=self.p, p2=self.p
@@ -249,7 +250,7 @@ class Tokenizer(nn.Module):
                 p1=self.p, p2=self.p
             )
         elif len(image_size) == 3:
-            self.fancy_rashape = lambda x: rearrange(
+            self.fancy_reshape = lambda x: rearrange(
                 x,
                 'b c (z p1) (h p2) (w p3) -> b (z h w) (c p1 p2 p3)',
                 p1=self.p, p2=self.p, p3=self.p
@@ -342,32 +343,6 @@ class CrossAttention(nn.Module):
     # return only the attention output; residual connection is applied in the transformer block
     attn_out, _ = self.mha(x, cond, cond, need_weights=False)
     return attn_out
-
-
-class CrossTransformerBlock(nn.Module):
-    def __init__(self, dim, cond_dim, heads=8, mlp_ratio=4.0, dropout=0.0):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.cross_attn = CrossAttention(q_dim=dim, k_dim=cond_dim, v_dim=cond_dim, heads=heads, dropout=dropout, bias=False)
-        self.norm2 = nn.LayerNorm(dim)
-        hidden = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, dim),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x, cond_tokens):
-        # cross-attention with residual
-        h = self.norm1(x)
-        attn_out = self.cross_attn(h, cond_tokens)
-        x += attn_out
-        # feed-forward with its own normalization and residual
-        x += self.mlp(self.norm2(x))
-        return x
-
 
 
 
