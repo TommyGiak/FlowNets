@@ -7,6 +7,8 @@ import torch
 import warnings
 
 from torch import nn
+import torch.nn.functional as F
+
 from einops import rearrange
 
 
@@ -48,33 +50,54 @@ def zero_init_(module):
                 p.zero_()
     return module
 
+def get_num_groups_for_channels(channels: int, default_groups: int = 32):
+
+    max_g = min(default_groups, channels)
+
+    for g in range(max_g, 0, -1):
+        if channels % g == 0:
+            return g
+
+    return 1
+
+class Identity(nn.Identity):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, input, *args):
+        return input
+
 
 # ---------------------------  Embeddings -------------------------
-# Sinusoidal time embedding
 class SinusoidalTimeEmb(nn.Module):
     def __init__(self, dim):
         super().__init__()
+        assert dim % 2 == 0, "Time embedding dim must be even."
+        
         self.dim = dim
-        self.half = self.dim // 2
+        half = dim // 2
 
-        # clearer check: dimension must be even
-        assert self.dim % 2 == 0, f'The dimension of the Positional embedding must be a multiple of 2, not {dim}!'
+        # Precompute frequencies (CPU is fine)
+        freqs = torch.exp(
+            -math.log(10000.0) * torch.arange(half, dtype=torch.float32) / half
+        )
+
+        # Register as buffer so it automatically moves to the model's device
+        self.register_buffer("freqs", freqs)
 
     def forward(self, t):
-        # t: (B,) floats in [0,1]
-        device = t.device
-        # use 'half' in the denominator so we don't divide by zero when half == 1
-        freqs = torch.exp(torch.arange(0, self.half, device=device, dtype=torch.float32) * -(math.log(10000.0) / self.half))
-        args = t.view(-1,1) * freqs[None, :]
+        # t : (B,) or (B,1)
+        t = t.view(-1, 1)                         # (B,1)
+        args = t * self.freqs[None, :]            # (B, half)
         emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        return emb
+        return emb                                # (B, dim)
+
     
 
 class PositionalEncodingND(nn.Module):
     def __init__(self, image_size, dim, patch_size):
         super().__init__()
-        assert dim % (2 * len(image_size)) == 0, \
-               "dim must be divisible by 2 * spatial_dims"
+        assert dim % (2 * len(image_size)) == 0, 'dim must be divisible by 2 * spatial_dims'
 
         self.spatial_dims = len(image_size)
         self.dim = dim
@@ -82,7 +105,7 @@ class PositionalEncodingND(nn.Module):
         
         grid_shape = [s // patch_size for s in image_size]
         
-        # Build grid: e.g. for 2D (H', W'), for 3D (Z', H', W')
+        # Build grid: for 2D (H', W'), for 3D (Z', H', W')
         coords = [torch.arange(n, dtype=torch.float32) for n in grid_shape]
         mesh = torch.meshgrid(*coords, indexing='ij')
         
@@ -93,9 +116,8 @@ class PositionalEncodingND(nn.Module):
         self.register_buffer("pe", pe.unsqueeze(0))  # (1, N, dim)
 
     def build_pe(self, coords):
-
-        ax = len(coords)
-        dim_per_axis = self.dim // ax
+        D = len(coords)
+        dim_per_axis = self.dim // D
         half = dim_per_axis // 2
 
         embeddings = []
@@ -125,76 +147,142 @@ class TimeSequential(nn.Sequential):
 
 
 # --------------------------- Building blocks -------------------------
-class ConvBlock(nn.Module):
-    def __init__(self, image_dimensionality, in_ch, out_ch, kernel_size=3, padding=1, use_norm=True, num_groups=16, dropout=0, zero_init=False):
-        super().__init__()
-        self.seq = nn.Sequential()
-        
-        if use_norm:
-            
-            num_groups = out_ch if num_groups>out_ch else num_groups
-
-            assert out_ch%num_groups==0, f'In the Conv2dBlock, the number of output channels ({out_ch}) must be a multiple of the number of groups ({num_groups})!'
-            if zero_init:
-                self.seq.append(zero_init_(convolution(image_dimensionality, in_ch, out_ch, kernel_size=kernel_size, padding=padding, bias=False)))
-            else:
-                self.seq.append(convolution(image_dimensionality, in_ch, out_ch, kernel_size=kernel_size, padding=padding, bias=False))
-            self.seq.append(nn.GroupNorm(num_groups=num_groups, num_channels=out_ch))
-        else:
-            if zero_init:
-                self.seq.append(zero_init_(convolution(image_dimensionality, in_ch, out_ch, kernel_size=kernel_size, padding=padding, bias=True)))
-            else:
-                self.seq.append(convolution(image_dimensionality, in_ch, out_ch, kernel_size=kernel_size, padding=padding, bias=True))
-        
-        self.seq.append(nn.SiLU())
-        
-        if dropout > 0:
-            self.seq.append(nn.Dropout(p=dropout))
-
-    def forward(self, x):
-        return self.seq(x)
-
-
 class ResidualBlock(nn.Module):
-    def __init__(self, image_dimensionality, ch, time_emb_dim=None, num_groups=16, dropout=0):
+    def __init__(self, image_dimensionality, ch, time_emb_dim=None, num_groups=32, dropout=0):
         super().__init__()
         self.img_dim = image_dimensionality
-        self.conv1 = ConvBlock(image_dimensionality, ch, ch, num_groups=num_groups, dropout=dropout)
-        
+
+        reshape_view = (1 for _ in range(image_dimensionality))
+        self.reshape_view = (ch, *reshape_view)
+
+        num_groups = get_num_groups_for_channels(ch, num_groups)
+
+        self.in_layers = nn.Sequential(
+            nn.GroupNorm(num_groups,ch),
+            nn.SiLU(),
+            convolution(image_dimensionality, ch, ch, kernel_size=3, padding=1),
+        )
+
         if time_emb_dim is not None:
             self.time_proj = nn.Linear(time_emb_dim, ch)
         else:
             self.time_proj = None
         
-        self.conv2 = ConvBlock(image_dimensionality, ch, ch, num_groups=num_groups, dropout=dropout, zero_init=True)
+        self.out_layers = nn.Sequential(
+            nn.GroupNorm(num_groups,ch),
+            nn.SiLU(),
+            nn.Dropout(p=dropout),
+            zero_init_(convolution(image_dimensionality, ch, ch, kernel_size=3, padding=1))
+        )
+        pass
 
     def forward(self, x, t_emb=None):
-        h = self.conv1(x)
+        h = self.in_layers(x)
 
         if self.time_proj is not None:
-            if t_emb is None:
-                raise RuntimeError("time embedding expected but not provided")
             proj = self.time_proj(t_emb)  # [B, ch]
             # reshape to [B, ch, 1, 1, ...]
-            shape = [proj.size(0), proj.size(1)] + [1] * (h.dim() - 2)
-            proj = proj.view(*shape)
+            proj = proj.view(proj.shape[0], *self.reshape_view)
             h = h + proj
 
-        h = self.conv2(h)
+        h = self.out_layers(h)
         return x + h
+
+
+#------------------------------------------------------------------------------------------------------------------------------------------------------------
+class SelfConvAttentionBlock(nn.Module):
+    """An attention block that allows spatial positions to attend to each other.
+
+    Originally ported from here, but adapted to the N-d case.
+    https://github.com/hojonathanho/diffusion/blob/1e0dceb3b3495bbe19116a5e1b3596cd0706c543/diffusion_tf/models/unet.py#L66.
+    """
+
+    def __init__(
+        self,
+        channels,
+        image_size,
+        dim,
+        patch_size,
+        heads=1,
+        num_head_channels=-1,
+        use_checkpoint=False,
+        dropout = 0.,
+    ):
+        super().__init__()
+        self.channels = channels
+        num_heads = heads
+        if num_head_channels == -1:
+            self.num_heads = num_heads
+        else:
+            assert (
+                channels % num_head_channels == 0
+            ), f"q,k,v channels {channels} is not divisible by num_head_channels {num_head_channels}"
+            self.num_heads = channels // num_head_channels
+        self.use_checkpoint = use_checkpoint
+        self.norm = nn.GroupNorm(get_num_groups_for_channels(channels),channels)
+        self.qkv = convolution(1, channels, channels * 3, 1)
+        # split qkv before split heads
+        self.attention = QKVAttention(self.num_heads)
+
+        self.proj_out = zero_init_(convolution(1, channels, channels, 1))
+
+    def forward(self, x, emb):
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = self.qkv(self.norm(x))
+        h = self.attention(qkv)
+        h = self.proj_out(h)
+        return (x + h).reshape(b, c, *spatial)
+    
+
+class QKVAttention(nn.Module):
+    """A module which performs QKV attention and splits in a different order."""
+
+    def __init__(self, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+
+    def forward(self, qkv):
+        """Apply QKV attention.
+
+        :param qkv: an [N x (3 * H * C) x T] tensor of Qs, Ks, and Vs.
+        :return: an [N x (H * C) x T] tensor after attention.
+        """
+        bs, width, length = qkv.shape
+        assert width % (3 * self.n_heads) == 0
+        ch = width // (3 * self.n_heads)
+        q, k, v = qkv.chunk(3, dim=1)
+        scale = 1 / math.sqrt(math.sqrt(ch))
+        weight = torch.einsum(
+            "bct,bcs->bts",
+            (q * scale).view(bs * self.n_heads, ch, length),
+            (k * scale).view(bs * self.n_heads, ch, length),
+        )  # More stable with f16 than dividing afterwards
+        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        a = torch.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
+        return a.reshape(bs, -1, length)
+
+#------------------------------------------------------------------------------------------------------------------------------------------------------------
+    
 
 
 # --------------------------- Resizing blocks -------------------------
 # Simple Downsample/Upsample
 class Downsample(nn.Module):
-    def __init__(self, image_dimensionality, in_ch, out_ch=None, conv_layer=True, num_groups=8):
+    def __init__(self, image_dimensionality, in_ch, out_ch=None, conv_layer=True, num_groups=16):
         super().__init__()
         self.op = nn.Sequential()
         if conv_layer:
             out_ch = out_ch or in_ch*2
-            self.op.append(convolution(image_dimensionality, in_ch, out_ch, kernel_size=3, stride=2, padding=1))
+            num_groups = get_num_groups_for_channels(in_ch, num_groups)
             if num_groups > 0:
-                self.op.append(nn.GroupNorm(num_groups, out_ch))
+                self.op.append(nn.GroupNorm(num_groups, in_ch))
+            self.op.append(nn.SiLU())
+            self.op.append(convolution(image_dimensionality, in_ch, in_ch, kernel_size=3, stride=1, padding=1, bias=False))
+            if num_groups > 0:
+                self.op.append(nn.GroupNorm(num_groups, in_ch))
+            self.op.append(nn.SiLU())
+            self.op.append(convolution(image_dimensionality, in_ch, out_ch, kernel_size=3, stride=2, padding=1))
         else:
             if out_ch is not None:
                 raise ValueError(f"If you don't use a conv layer the output channels must be the same of the input channels, not {out_ch}")
@@ -213,11 +301,17 @@ class Upsample(nn.Module):
         if conv_layer:
             out_ch = out_ch or in_ch//2
             
-            num_groups = out_ch if num_groups>out_ch else num_groups
-            
-            self.op.append(convolution_transpose(image_dimensionality, in_ch, out_ch, kernel_size=4, stride=2, padding=1))
+            num_groups = get_num_groups_for_channels(in_ch,num_groups)
+
             if num_groups:
-                self.op.append(nn.GroupNorm(num_groups, out_ch))
+                self.op.append(nn.GroupNorm(num_groups, in_ch))
+            self.op.append(nn.SiLU())
+            self.op.append(convolution(image_dimensionality, in_ch, in_ch, kernel_size=3, stride=1, padding=1, bias=False))
+            if num_groups:
+                self.op.append(nn.GroupNorm(num_groups, in_ch))
+            self.op.append(nn.SiLU())
+            self.op.append(convolution_transpose(image_dimensionality, in_ch, out_ch, kernel_size=4, stride=2, padding=1))
+
         else:
           if out_ch is not None:
                 raise ValueError(f"If you don't use a conv layer the output channels must be the same of the input channels, not {out_ch}")
@@ -225,7 +319,6 @@ class Upsample(nn.Module):
 
     def forward(self, x):
         return self.op(x)
-
 
 # ------------------------- Tokenizer -------------------
 class Tokenizer(nn.Module):
@@ -235,8 +328,8 @@ class Tokenizer(nn.Module):
         self.image_size = image_size
 
         for d in image_size:
-            assert d%patch_size==0, f'The image size at this layer {image_size} must be a multiple of the patch size {patch_size}! :=('
-        
+            assert d%patch_size==0, f'Image dimension {d} must be divisible by patch size {patch_size}'
+
         if len(image_size) == 2:
             self.fancy_reshape = lambda x: rearrange(
                 x,
@@ -271,6 +364,22 @@ class Tokenizer(nn.Module):
     
     def invert_tokenization(self,tokens):
         return self.invert_fancy_reshape(tokens)
+    
+
+# ------------------------- adaLNZero -------------------
+class AdaLNZero(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.linear = nn.Linear(dim, 6 * dim)
+
+        zero_init_(self.linear)
+
+    def forward(self, emb):
+        params = self.linear(emb) # (B, 6*dim)
+        params = params.unsqueeze(1) # (B,1,6*dim)
+        sA, bA, gA, sM, bM, gM = params.chunk(6, dim=-1)
+        return sA, bA, gA, sM, bM, gM
+
 
 
 # ------------------------- Self-Attention -------------------
@@ -278,21 +387,33 @@ class SelfAttentionBlock(nn.Module):
     def __init__(self, channels, image_size, dim, patch_size, heads=8, mlp_ratio=4.0, dropout=0.0):
         super().__init__()
 
-        self.tokenizer = Tokenizer(image_size=image_size, patch_size=patch_size)
+        self.dropout = dropout
+
+        self.tokenizer = Tokenizer(image_size, patch_size)
         patch_volume = patch_size**len(image_size)
+        
         self.tokens_projection = nn.Linear(channels*patch_volume, dim)
+        
         self.pos_enc = PositionalEncodingND(image_size, dim, patch_size)
 
-        self.norm1 = nn.RMSNorm(dim)
-        self.attn = nn.MultiheadAttention(
+        self.adaln = AdaLNZero(dim)
+
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+
+        #-------------- Attention --------------
+        self.heads = heads
+        assert dim % heads == 0, f'dimension of th embedding {dim} must be divisible by number of heads {heads}'
+        self.head_dim = dim // heads
+
+        #self.qkv = nn.Linear(dim, 3 * dim)
+        self.qkv = convolution(1, dim, 3 * dim, 1)
+
+        '''self.attn = nn.MultiheadAttention(
             embed_dim=dim,
             num_heads=heads,
             dropout=dropout,
-            batch_first=True
-            )
-        
-        self.attn_dropout = nn.Dropout(dropout)
-        self.norm2 = nn.RMSNorm(dim)
+        )'''
 
         hidden = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
@@ -302,25 +423,49 @@ class SelfAttentionBlock(nn.Module):
             nn.Linear(hidden, dim),
             nn.Dropout(dropout),
         )
-        self.out_reshape = nn.Linear(dim, channels*patch_volume)
         
-        warnings.warn('The attention mechanism is implemented with torch, you may use flash attention... Flash attention is wanderful!')
-        warnings.warn('The attention transformer block do not use ADAPTIVE layer/group norm... We do not like mutants')
+        self.out_proj = nn.Linear(dim, channels*patch_volume)
 
-    def forward(self, x):
+    def _split_heads(self, x):
+        # x: (B, N, dim) -> (B, heads, N, head_dim)
+        B, N, D = x.shape
+        x = x.view(B, N, self.heads, self.head_dim)   # (B, N, H, Hd)
+        x = x.permute(0, 2, 1, 3).contiguous()        # (B, H, N, Hd)
+        return x
+    
+    def _combine_heads(self, x):
+        # x: (B, heads, N, head_dim) -> (B, N, dim)
+        B, H, N, Hd = x.shape
+        x = x.permute(0, 2, 1, 3).contiguous()        # (B, N, H, Hd)
+        x = x.view(B, N, H * Hd)
+        return x
+
+
+    def forward(self, x, emb):
         # x: (B, C, *IMG_SIZE)
-        x = self.tokenizer.tokenization(x) # x: (B, N, dim)
-        x = self.tokens_projection(x)
-        x = self.pos_enc(x)
-        h = self.norm1(x)
+        t = self.tokenizer.tokenization(x)
+        t = self.tokens_projection(t) # x: (B, N, dim)
+        t = self.pos_enc(t)
+
+        sA, bA, gA, sM, bM, gM = self.adaln(emb)
         
-        attn_out, _ = self.attn(h, h, h, need_weights=False)
-        attn_out = self.attn_dropout(attn_out)
-        x = x + attn_out
+        h = self.norm1(t) * (1 + sA) + bA
         
-        x = x + self.mlp(self.norm2(x)) # x: (B, N, dim)
-        x = self.out_reshape(x)
-        return self.tokenizer.invert_tokenization(x)
+        q, k, v = self.qkv(h.permute(0,2,1)).permute(0,2,1).chunk(3, dim=-1)
+        q, k, v = self._split_heads(q), self._split_heads(k), self._split_heads(v) # (B, H, N, Hd)
+        h_att = F.scaled_dot_product_attention(q, k, v, attn_mask=None,
+                                                  dropout_p=self.dropout,
+                                                  is_causal=False)  # (B, H, N, Hd)
+        h_att = self._combine_heads(h_att)
+        # h_att, _ = self.attn(h, h, h, need_weights=False)
+        t = t + gA * h_att
+
+        h = self.norm2(t) * (1 + sM) + bM
+        h = self.mlp(h)
+        t = t + gM * h
+
+        t = self.out_proj(t)
+        return self.tokenizer.invert_tokenization(t)
 
 
 # ----------------------- Cross-Attention modules -----------------------
@@ -343,6 +488,4 @@ class CrossAttention(nn.Module):
     # return only the attention output; residual connection is applied in the transformer block
     attn_out, _ = self.mha(x, cond, cond, need_weights=False)
     return attn_out
-
-
 
