@@ -5,7 +5,7 @@
 import torch
 
 from torch import nn
-from .BlocksAndLayers import SinusoidalTimeEmb, TimeSequential, ResidualBlock, Downsample, Upsample, convolution, zero_init_, get_num_groups_for_channels, Identity
+from .BlocksAndLayers import SinusoidalTimeEmb, EmbeddingSequential, ResidualBlock, Downsample, Upsample, convolution, zero_init_, get_num_groups_for_channels, Identity
 from .BlocksAndLayers import SelfConvAttentionBlock as SelfAttentionBlock
 
 class SimpleUNet(nn.Module): # without attention
@@ -27,7 +27,7 @@ class SimpleUNet(nn.Module): # without attention
         self.chs = channels_per_down
         self.n_residuals_blocks = n_residuals_blocks
         
-        self.first_num_groups = 4 if self.chs[0]>=4 else self.chs[0]
+        self.first_num_groups = 16 if self.chs[0]>16 else self.chs[0]//2
         
         self.time_mlp = nn.Sequential(SinusoidalTimeEmb(time_emb_dim), nn.Linear(time_emb_dim, time_emb_dim), nn.SiLU(), nn.Linear(time_emb_dim, time_emb_dim))
         
@@ -40,7 +40,7 @@ class SimpleUNet(nn.Module): # without attention
 
         # Encoder
         self.res_blocks_encoder = nn.ModuleList(
-                            TimeSequential(*[ResidualBlock(d, ch=c, time_emb_dim=time_emb_dim)
+                            EmbeddingSequential(*[ResidualBlock(d, ch=c, time_emb_dim=time_emb_dim)
                                               for _ in range(n_residuals_blocks)])
                             for c in self.chs[:-1]
                             )
@@ -51,15 +51,15 @@ class SimpleUNet(nn.Module): # without attention
         
         # Bottleneck 
         bottleneck_ch = self.chs[-1]
-        self.bottleneck_res = TimeSequential(*[ResidualBlock(d, ch=bottleneck_ch, time_emb_dim=time_emb_dim) for _ in range(n_residuals_blocks)])
+        self.bottleneck_res = EmbeddingSequential(*[ResidualBlock(d, ch=bottleneck_ch, time_emb_dim=time_emb_dim) for _ in range(n_residuals_blocks)])
 
         # Up path
         self.ups = nn.ModuleList([Upsample(d, in_ch=ic, out_ch=oc) for ic, oc in zip(reversed(self.chs[1:]), reversed(self.chs[:-1]))])
         self.conv_skip_connection_decored = nn.ModuleList(
-            [nn.Sequential(*[nn.GroupNorm(get_num_groups_for_channels(oc*2),oc*2), nn.SiLU(), convolution(d, oc*2, oc, kernel_size=3, padding=1)]) for oc in reversed(self.chs[:-1])]
+            [nn.Sequential(*[convolution(d, oc*2, oc, kernel_size=3, padding=1), nn.GroupNorm(get_num_groups_for_channels(oc),oc), nn.SiLU()]) for oc in reversed(self.chs[:-1])]
         )
         self.res_blocks_decoder = nn.ModuleList(
-                    TimeSequential(*[ResidualBlock(d, ch=c, time_emb_dim=time_emb_dim)
+                    EmbeddingSequential(*[ResidualBlock(d, ch=c, time_emb_dim=time_emb_dim)
                                         for _ in range(n_residuals_blocks)])
                     for c in reversed(self.chs[:-1])
                 )
@@ -67,13 +67,23 @@ class SimpleUNet(nn.Module): # without attention
         assert len(self.res_blocks_decoder) == len(self.ups) == len(self.conv_skip_connection_decored)
         
         self.out_res = nn.Sequential(
-            zero_init_(convolution(d, in_channels=self.chs[0], out_channels=in_channels, kernel_size=3, padding=1, bias=True)),
+            convolution(d, in_channels=self.chs[0], out_channels=in_channels, kernel_size=3, padding=1, bias=True),
         )
 
         pass
     
     def get_parameters_number(self):
         return sum(p.numel() for p in self.parameters())
+
+    def get_parameters_dtype(self):
+        dict_data_param = {}
+        for n, d in self.named_parameters():
+            dtype = d.dtype
+            if dtype in dict_data_param.keys():
+                dict_data_param[dtype].append(n)
+            else:
+                dict_data_param[dtype] = [n]
+        return dict_data_param
 
     def forward(self, t, z_t):
         # z_t: (B, C, *IMG_SIZE)
@@ -150,7 +160,7 @@ class SelfUNet(nn.Module): # without attention
 
         # Encoder
         self.res_blocks_encoder = nn.ModuleList(
-                            TimeSequential(*[ResidualBlock(d, ch=c, time_emb_dim=time_emb_dim)
+                            EmbeddingSequential(*[ResidualBlock(d, ch=c, time_emb_dim=time_emb_dim)
                                               for _ in range(n_residuals_blocks)])
                             for c in self.chs[:-1]
                             )
@@ -174,8 +184,8 @@ class SelfUNet(nn.Module): # without attention
         
         # Bottleneck 
         bottleneck_ch = self.chs[-1]
-        self.bottleneck_res_1 = TimeSequential(*[ResidualBlock(d, ch=bottleneck_ch, time_emb_dim=time_emb_dim) for _ in range(n_residuals_blocks)])
-        self.bottleneck_res_2 = TimeSequential(*[ResidualBlock(d, ch=bottleneck_ch, time_emb_dim=time_emb_dim) for _ in range(n_residuals_blocks)])
+        self.bottleneck_res_1 = EmbeddingSequential(*[ResidualBlock(d, ch=bottleneck_ch, time_emb_dim=time_emb_dim) for _ in range(n_residuals_blocks)])
+        self.bottleneck_res_2 = EmbeddingSequential(*[ResidualBlock(d, ch=bottleneck_ch, time_emb_dim=time_emb_dim) for _ in range(n_residuals_blocks)])
 
         # Up path
         self.ups = nn.ModuleList([Upsample(d, in_ch=ic, out_ch=oc) for ic, oc in zip(reversed(self.chs[1:]), reversed(self.chs[:-1]))])
@@ -189,7 +199,7 @@ class SelfUNet(nn.Module): # without attention
             self.conv_skip_connection_decored.append(nn.Sequential(*layers))
 
         self.res_blocks_decoder = nn.ModuleList(
-                    TimeSequential(*[ResidualBlock(d, ch=c, time_emb_dim=time_emb_dim)
+                    EmbeddingSequential(*[ResidualBlock(d, ch=c, time_emb_dim=time_emb_dim)
                                         for _ in range(n_residuals_blocks)])
                     for c in reversed(self.chs[:-1])
                 )
@@ -219,6 +229,16 @@ class SelfUNet(nn.Module): # without attention
     
     def get_parameters_number(self):
         return sum(p.numel() for p in self.parameters())
+    
+    def get_parameters_dtype(self):
+        dict_data_param = {}
+        for n, d in self.named_parameters():
+            dtype = d.dtype
+            if dtype in dict_data_param.keys():
+                dict_data_param[dtype].append(n)
+            else:
+                dict_data_param[dtype] = [n]
+        return dict_data_param
 
     def forward(self, t, z_t):
         # z_t: (B, C, *IMG_SIZE)

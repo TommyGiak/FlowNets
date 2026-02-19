@@ -52,7 +52,7 @@ def zero_init_(module):
 
 def get_num_groups_for_channels(channels: int, default_groups: int = 32):
 
-    max_g = min(default_groups, channels)
+    max_g = min(channels//2, default_groups)
 
     for g in range(max_g, 0, -1):
         if channels % g == 0:
@@ -135,20 +135,20 @@ class PositionalEncodingND(nn.Module):
         return x + self.pe
 
 
-class TimeSequential(nn.Sequential):
+class EmbeddingSequential(nn.Sequential):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         pass
       
-    def forward(self, input, t_emb=None):
+    def forward(self, input, emb=None):
         for module in self:
-            input = module(input, t_emb)
+            input = module(input, emb)
         return input
 
 
 # --------------------------- Building blocks -------------------------
 class ResidualBlock(nn.Module):
-    def __init__(self, image_dimensionality, ch, time_emb_dim=None, num_groups=32, dropout=0):
+    def __init__(self, image_dimensionality, ch, time_emb_dim=None, num_groups=32, dropout=0, zero_init_last=True):
         super().__init__()
         self.img_dim = image_dimensionality
 
@@ -158,22 +158,27 @@ class ResidualBlock(nn.Module):
         num_groups = get_num_groups_for_channels(ch, num_groups)
 
         self.in_layers = nn.Sequential(
+            convolution(image_dimensionality, ch, ch, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(num_groups,ch),
             nn.SiLU(),
-            convolution(image_dimensionality, ch, ch, kernel_size=3, padding=1),
         )
 
         if time_emb_dim is not None:
             self.time_proj = nn.Linear(time_emb_dim, ch)
         else:
             self.time_proj = None
-        
+
+        if zero_init_last:
+            self.out_conv = zero_init_(convolution(image_dimensionality, ch, ch, kernel_size=3, padding=1))
+        else:
+            self.out_conv = convolution(image_dimensionality, ch, ch, kernel_size=3, padding=1, bias=False)
+
         self.out_layers = nn.Sequential(
             nn.GroupNorm(num_groups,ch),
             nn.SiLU(),
-            nn.Dropout(p=dropout),
-            zero_init_(convolution(image_dimensionality, ch, ch, kernel_size=3, padding=1))
+            nn.Dropout(p=dropout)
         )
+
         pass
 
     def forward(self, x, t_emb=None):
@@ -185,6 +190,7 @@ class ResidualBlock(nn.Module):
             proj = proj.view(proj.shape[0], *self.reshape_view)
             h = h + proj
 
+        h = self.out_conv(h)
         h = self.out_layers(h)
         return x + h
 
@@ -269,20 +275,23 @@ class QKVAttention(nn.Module):
 # --------------------------- Resizing blocks -------------------------
 # Simple Downsample/Upsample
 class Downsample(nn.Module):
-    def __init__(self, image_dimensionality, in_ch, out_ch=None, conv_layer=True, num_groups=16):
+    def __init__(self, image_dimensionality, in_ch, out_ch=None, conv_layer=True, num_groups=32):
         super().__init__()
         self.op = nn.Sequential()
+
         if conv_layer:
             out_ch = out_ch or in_ch*2
             num_groups = get_num_groups_for_channels(in_ch, num_groups)
-            if num_groups > 0:
-                self.op.append(nn.GroupNorm(num_groups, in_ch))
-            self.op.append(nn.SiLU())
+
             self.op.append(convolution(image_dimensionality, in_ch, in_ch, kernel_size=3, stride=1, padding=1, bias=False))
             if num_groups > 0:
                 self.op.append(nn.GroupNorm(num_groups, in_ch))
             self.op.append(nn.SiLU())
-            self.op.append(convolution(image_dimensionality, in_ch, out_ch, kernel_size=3, stride=2, padding=1))
+            
+            self.op.append(convolution(image_dimensionality, in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False))
+            if num_groups > 0:
+                self.op.append(nn.GroupNorm(num_groups, out_ch))
+            self.op.append(nn.SiLU())
         else:
             if out_ch is not None:
                 raise ValueError(f"If you don't use a conv layer the output channels must be the same of the input channels, not {out_ch}")
@@ -300,17 +309,17 @@ class Upsample(nn.Module):
         
         if conv_layer:
             out_ch = out_ch or in_ch//2
-            
             num_groups = get_num_groups_for_channels(in_ch,num_groups)
 
-            if num_groups:
-                self.op.append(nn.GroupNorm(num_groups, in_ch))
-            self.op.append(nn.SiLU())
             self.op.append(convolution(image_dimensionality, in_ch, in_ch, kernel_size=3, stride=1, padding=1, bias=False))
-            if num_groups:
+            if num_groups > 0:
                 self.op.append(nn.GroupNorm(num_groups, in_ch))
             self.op.append(nn.SiLU())
-            self.op.append(convolution_transpose(image_dimensionality, in_ch, out_ch, kernel_size=4, stride=2, padding=1))
+            
+            self.op.append(convolution_transpose(image_dimensionality, in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=False))
+            if num_groups > 0:
+                self.op.append(nn.GroupNorm(num_groups, out_ch))
+            self.op.append(nn.SiLU())
 
         else:
           if out_ch is not None:
