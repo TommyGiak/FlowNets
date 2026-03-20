@@ -3,7 +3,7 @@ from .UNets import SimpleUNet, SelfUNet
 from .version import __version__
 
 __all__ = [
-  'SimpleUNet'
+  'SimpleUNet',
   'SelfUNet',
-  '__version__'
+  '__version__',
   ]

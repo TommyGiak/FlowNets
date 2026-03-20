@@ -29,12 +29,12 @@ class SimpleUNet(nn.Module): # without attention
         
         self.first_num_groups = 16 if self.chs[0]>16 else self.chs[0]//2
         
-        self.time_mlp = nn.Sequential(SinusoidalTimeEmb(time_emb_dim), nn.Linear(time_emb_dim, time_emb_dim), nn.SiLU(), nn.Linear(time_emb_dim, time_emb_dim))
+        self.time_mlp = nn.Sequential(SinusoidalTimeEmb(time_emb_dim), nn.Linear(time_emb_dim, time_emb_dim), nn.SELU(), nn.Linear(time_emb_dim, time_emb_dim))
         
         self.in_res = nn.Sequential(
             convolution(d, in_channels=in_channels, out_channels=self.chs[0], kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(self.first_num_groups,self.chs[0]),
-            nn.SiLU(),
+            nn.SELU(),
             nn.Dropout(p=dropout),
         )
 
@@ -56,7 +56,7 @@ class SimpleUNet(nn.Module): # without attention
         # Up path
         self.ups = nn.ModuleList([Upsample(d, in_ch=ic, out_ch=oc) for ic, oc in zip(reversed(self.chs[1:]), reversed(self.chs[:-1]))])
         self.conv_skip_connection_decored = nn.ModuleList(
-            [nn.Sequential(*[convolution(d, oc*2, oc, kernel_size=3, padding=1), nn.GroupNorm(get_num_groups_for_channels(oc),oc), nn.SiLU()]) for oc in reversed(self.chs[:-1])]
+            [nn.Sequential(*[convolution(d, oc*2, oc, kernel_size=3, padding=1, bias=False), nn.GroupNorm(get_num_groups_for_channels(oc),oc), nn.SELU()]) for oc in reversed(self.chs[:-1])]
         )
         self.res_blocks_decoder = nn.ModuleList(
                     EmbeddingSequential(*[ResidualBlock(d, ch=c, time_emb_dim=time_emb_dim)
@@ -118,7 +118,7 @@ class SelfUNet(nn.Module): # without attention
                  img_size : tuple,
                  in_channels=1,
                  channels_per_down=[8,16,32,64,128], # image size [1,2,4,8,16]**(-1)
-                 attn_p_per_down=[None,None,2,None,1],
+                 attn_p_per_down=[None,None,2,1,1],
                  attn_p_per_up=None,
                  n_residuals_blocks=1,
                  time_emb_dim=264, # must be multiple of the image dimensionality!
@@ -152,10 +152,15 @@ class SelfUNet(nn.Module): # without attention
         self.chs = channels_per_down
         self.n_residuals_blocks = n_residuals_blocks
         
-        self.time_mlp = nn.Sequential(SinusoidalTimeEmb(time_emb_dim), nn.Linear(time_emb_dim, time_emb_dim), nn.SiLU(), nn.Linear(time_emb_dim, time_emb_dim))
+        self.first_num_groups = 16 if self.chs[0]>16 else self.chs[0]//2
+        
+        self.time_mlp = nn.Sequential(SinusoidalTimeEmb(time_emb_dim), nn.Linear(time_emb_dim, time_emb_dim), nn.SELU(), nn.Linear(time_emb_dim, time_emb_dim))
         
         self.in_conv = nn.Sequential(
-            convolution(d, in_channels=in_channels, out_channels=self.chs[0], kernel_size=3, padding=1, bias=False)            
+            convolution(d, in_channels=in_channels, out_channels=self.chs[0], kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(self.first_num_groups,self.chs[0]),
+            nn.SELU(),
+            nn.Dropout(p=dropout),
         )
 
         # Encoder
@@ -164,7 +169,7 @@ class SelfUNet(nn.Module): # without attention
                                               for _ in range(n_residuals_blocks)])
                             for c in self.chs[:-1]
                             )
-            
+        
         self.downs = nn.ModuleList([Downsample(d, in_ch=ic, out_ch=oc) for ic, oc in zip(self.chs[:-1], self.chs[1:])])
         
         self.attn_down = nn.ModuleList()
@@ -193,9 +198,9 @@ class SelfUNet(nn.Module): # without attention
         self.conv_skip_connection_decored = nn.ModuleList()
         for oc in reversed(self.chs[:-1]):
             layers = []
-            layers.append(nn.GroupNorm(get_num_groups_for_channels(oc*2),oc*2))
-            layers.append(nn.SiLU())
-            layers.append(convolution(d, oc*2, oc, kernel_size=3, padding=1))
+            layers.append(convolution(d, oc*2, oc, kernel_size=3, padding=1, bias=False))
+            layers.append(nn.GroupNorm(get_num_groups_for_channels(oc),oc))
+            layers.append(nn.SELU())
             self.conv_skip_connection_decored.append(nn.Sequential(*layers))
 
         self.res_blocks_decoder = nn.ModuleList(
@@ -220,11 +225,8 @@ class SelfUNet(nn.Module): # without attention
         assert len(self.res_blocks_decoder) == len(self.ups) == len(self.conv_skip_connection_decored) == len(self.attn_up)
         
         self.out_cov = nn.Sequential(
-            #nn.GroupNorm(self.first_num_groups,self.chs[0]),
-            #nn.SiLU(),
-            zero_init_(convolution(d, in_channels=self.chs[0], out_channels=in_channels, kernel_size=3, padding=1, bias=True)),
-        ) #!! Ha senso l'output così??? Boh secondo me non tanto...
-
+            convolution(d, in_channels=self.chs[0], out_channels=in_channels, kernel_size=3, padding=1, bias=True),
+        )
         pass
     
     def get_parameters_number(self):
