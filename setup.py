@@ -18,8 +18,8 @@ version_py = os.path.join(HERE, package_name, "version.py")
 with open(version_py, encoding="utf-8") as f:
     version = f.read().strip().split(" ")[-1].strip("'\"")
 
-# Legge il README
-readme_path = os.path.join(HERE, package_name, "README.md")
+# Legge il README principale del repository
+readme_path = os.path.join(HERE, "README.md")
 with open(readme_path, encoding="utf-8") as f:
     long_description = f.read()
 
