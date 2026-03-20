@@ -16,7 +16,7 @@ def read_requirements():
 # Legge la versione
 version_py = os.path.join(HERE, package_name, "version.py")
 with open(version_py, encoding="utf-8") as f:
-    version = f.read().split(" ")[-1][1:-1]
+    version = f.read().strip().split(" ")[-1].strip("'\"")
 
 # Legge il README
 readme_path = os.path.join(HERE, package_name, "README.md")
