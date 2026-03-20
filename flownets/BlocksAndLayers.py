@@ -160,7 +160,7 @@ class ResidualBlock(nn.Module):
         self.in_layers = nn.Sequential(
             convolution(image_dimensionality, ch, ch, kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(num_groups,ch),
-            nn.SELU(),
+            nn.SiLU(),
         )
 
         if time_emb_dim is not None:
@@ -175,7 +175,7 @@ class ResidualBlock(nn.Module):
 
         self.out_layers = nn.Sequential(
             nn.GroupNorm(num_groups,ch),
-            nn.SELU(),
+            nn.SiLU(),
             nn.Dropout(p=dropout)
         )
 
@@ -286,12 +286,12 @@ class Downsample(nn.Module):
             self.op.append(convolution(image_dimensionality, in_ch, in_ch, kernel_size=3, stride=1, padding=1, bias=False))
             if num_groups > 0:
                 self.op.append(nn.GroupNorm(num_groups, in_ch))
-            self.op.append(nn.SELU())
+            self.op.append(nn.SiLU())
             
             self.op.append(convolution(image_dimensionality, in_ch, out_ch, kernel_size=3, stride=2, padding=1, bias=False))
             if num_groups > 0:
                 self.op.append(nn.GroupNorm(num_groups, out_ch))
-            self.op.append(nn.SELU())
+            self.op.append(nn.SiLU())
         else:
             if out_ch is not None:
                 raise ValueError(f"If you don't use a conv layer the output channels must be the same of the input channels, not {out_ch}")
@@ -314,12 +314,12 @@ class Upsample(nn.Module):
             self.op.append(convolution(image_dimensionality, in_ch, in_ch, kernel_size=3, stride=1, padding=1, bias=False))
             if num_groups > 0:
                 self.op.append(nn.GroupNorm(num_groups, in_ch))
-            self.op.append(nn.SELU())
+            self.op.append(nn.SiLU())
             
             self.op.append(convolution_transpose(image_dimensionality, in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=False))
             if num_groups > 0:
                 self.op.append(nn.GroupNorm(num_groups, out_ch))
-            self.op.append(nn.SELU())
+            self.op.append(nn.SiLU())
 
         else:
           if out_ch is not None:
@@ -427,7 +427,7 @@ class SelfAttentionBlock(nn.Module):
         hidden = int(dim * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(dim, hidden),
-            nn.SELU(),
+            nn.SiLU(),
             nn.Dropout(dropout),
             nn.Linear(hidden, dim),
             nn.Dropout(dropout),
@@ -497,4 +497,3 @@ class CrossAttention(nn.Module):
     # return only the attention output; residual connection is applied in the transformer block
     attn_out, _ = self.mha(x, cond, cond, need_weights=False)
     return attn_out
-

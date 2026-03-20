@@ -6,7 +6,7 @@ import torch
 
 from torch import nn
 from .BlocksAndLayers import SinusoidalTimeEmb, EmbeddingSequential, ResidualBlock, Downsample, Upsample, convolution, zero_init_, get_num_groups_for_channels, Identity
-from .BlocksAndLayers import SelfConvAttentionBlock as SelfAttentionBlock
+from .BlocksAndLayers import SelfAttentionBlock
 
 class SimpleUNet(nn.Module): # without attention
     def __init__(self,
@@ -29,12 +29,12 @@ class SimpleUNet(nn.Module): # without attention
         
         self.first_num_groups = 16 if self.chs[0]>16 else self.chs[0]//2
         
-        self.time_mlp = nn.Sequential(SinusoidalTimeEmb(time_emb_dim), nn.Linear(time_emb_dim, time_emb_dim), nn.SELU(), nn.Linear(time_emb_dim, time_emb_dim))
+        self.time_mlp = nn.Sequential(SinusoidalTimeEmb(time_emb_dim), nn.Linear(time_emb_dim, time_emb_dim), nn.SiLU(), nn.Linear(time_emb_dim, time_emb_dim))
         
         self.in_res = nn.Sequential(
             convolution(d, in_channels=in_channels, out_channels=self.chs[0], kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(self.first_num_groups,self.chs[0]),
-            nn.SELU(),
+            nn.SiLU(),
             nn.Dropout(p=dropout),
         )
 
@@ -56,7 +56,7 @@ class SimpleUNet(nn.Module): # without attention
         # Up path
         self.ups = nn.ModuleList([Upsample(d, in_ch=ic, out_ch=oc) for ic, oc in zip(reversed(self.chs[1:]), reversed(self.chs[:-1]))])
         self.conv_skip_connection_decored = nn.ModuleList(
-            [nn.Sequential(*[convolution(d, oc*2, oc, kernel_size=3, padding=1, bias=False), nn.GroupNorm(get_num_groups_for_channels(oc),oc), nn.SELU()]) for oc in reversed(self.chs[:-1])]
+            [nn.Sequential(*[convolution(d, oc*2, oc, kernel_size=3, padding=1, bias=False), nn.GroupNorm(get_num_groups_for_channels(oc),oc), nn.SiLU()]) for oc in reversed(self.chs[:-1])]
         )
         self.res_blocks_decoder = nn.ModuleList(
                     EmbeddingSequential(*[ResidualBlock(d, ch=c, time_emb_dim=time_emb_dim)
@@ -127,6 +127,7 @@ class SelfUNet(nn.Module): # without attention
       
         super().__init__()
         assert (len(img_size) == 2) or (len(img_size) == 3), f'Image dimensionality must be 2 or 3, not {len(img_size)}'
+        assert time_emb_dim % (2 * len(img_size)) == 0, f'time_emb_dim must be divisible by {2 * len(img_size)} for positional encoding, not {time_emb_dim}'
         assert len(attn_p_per_down) == len(channels_per_down)
         if attn_p_per_up is not None:
             assert len(attn_p_per_up) == len(channels_per_down)
@@ -154,12 +155,12 @@ class SelfUNet(nn.Module): # without attention
         
         self.first_num_groups = 16 if self.chs[0]>16 else self.chs[0]//2
         
-        self.time_mlp = nn.Sequential(SinusoidalTimeEmb(time_emb_dim), nn.Linear(time_emb_dim, time_emb_dim), nn.SELU(), nn.Linear(time_emb_dim, time_emb_dim))
+        self.time_mlp = nn.Sequential(SinusoidalTimeEmb(time_emb_dim), nn.Linear(time_emb_dim, time_emb_dim), nn.SiLU(), nn.Linear(time_emb_dim, time_emb_dim))
         
         self.in_conv = nn.Sequential(
             convolution(d, in_channels=in_channels, out_channels=self.chs[0], kernel_size=3, padding=1, bias=False),
             nn.GroupNorm(self.first_num_groups,self.chs[0]),
-            nn.SELU(),
+            nn.SiLU(),
             nn.Dropout(p=dropout),
         )
 
@@ -200,7 +201,7 @@ class SelfUNet(nn.Module): # without attention
             layers = []
             layers.append(convolution(d, oc*2, oc, kernel_size=3, padding=1, bias=False))
             layers.append(nn.GroupNorm(get_num_groups_for_channels(oc),oc))
-            layers.append(nn.SELU())
+            layers.append(nn.SiLU())
             self.conv_skip_connection_decored.append(nn.Sequential(*layers))
 
         self.res_blocks_decoder = nn.ModuleList(
@@ -272,4 +273,3 @@ class SelfUNet(nn.Module): # without attention
             x = res(x, t_emb)
 
         return self.out_cov(x)
-
